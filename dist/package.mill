@@ -504,23 +504,195 @@ object `package` extends MillJavaModule with Proguard with DistModule {
     // from processed jars, not process the binary itself (which isn't a jar)
     override def executableVersioned: T[PathRef] = install.nativeImage()
 
-    def nativeImageOptions = Seq(
-      "--no-fallback",
-      "--enable-url-protocols=https",
-      "-Os",
-      // Build for compatibility with older CPUs that lack AVX2 and other modern features
-      // https://github.com/com-lihaoyi/mill/issues/4630
-      "-march=compatibility",
-      // Allow users to use authenticated proxies
-      "-Djdk.http.auth.tunneling.disabledSchemes=",
-      // Set UTF-8 encoding to fix Unicode character display issues on Windows
-      "-Dfile.encoding=UTF-8",
-      "-Dsun.stdout.encoding=UTF-8",
-      "-Dsun.stderr.encoding=UTF-8"
-      // Enable JVisualVM support
-      // https://www.graalvm.org/latest/tools/visualvm/#using-visualvm-with-graalvm-native-executables
-      // "--enable-monitoring=jvmstat,heapdump"
-    )
+    // ============ Static linking with musl (Linux only) ============
+    // See https://github.com/com-lihaoyi/mill/discussions/5568
+    // These tasks download and build musl, zlib, and mimalloc to produce a statically-linked
+    // native image that works on older Linux distros (RHEL8, Ubuntu 20.04, etc.)
+
+    def muslVersion: T[String] = Task { "1.2.5" }
+    def zlibVersion: T[String] = Task { "1.3.1" }
+    def mimallocVersion: T[String] = Task { "2.1.9" }
+
+    /** Download and build the musl libc toolchain */
+    def muslToolchain = Task {
+      val dest = Task.dest
+      val muslHome = dest / "musl-toolchain"
+      val muslTarball = s"musl-${muslVersion()}.tar.gz"
+      val muslUrl = s"https://musl.libc.org/releases/$muslTarball"
+
+      // Download musl source
+      os.write(dest / muslTarball, requests.get.stream(muslUrl))
+
+      // Extract
+      os.proc("tar", "-xzf", muslTarball).call(cwd = dest)
+
+      // Configure and build musl
+      // Use --syslibdir pointing to our local directory to avoid needing root permissions
+      val muslSrcDir = dest / s"musl-${muslVersion()}"
+      os.proc(
+        "./configure",
+        s"--prefix=$muslHome",
+        s"--syslibdir=$muslHome/lib",
+        "--static",
+        "--disable-shared"
+      ).call(cwd = muslSrcDir)
+      os.proc("make", "-j", java.lang.Runtime.getRuntime.availableProcessors().toString)
+        .call(cwd = muslSrcDir)
+      os.proc("make", "install").call(cwd = muslSrcDir)
+
+      // Create the symlink for x86_64-linux-musl-gcc (required by GraalVM)
+      val arch = System.getProperty("os.arch") match {
+        case "amd64" => "x86_64"
+        case s => s
+      }
+      os.symlink(muslHome / "bin" / s"$arch-linux-musl-gcc", muslHome / "bin" / "musl-gcc")
+
+      PathRef(muslHome)
+    }
+
+    /** Download and build zlib with musl (required for static linking) */
+    def zlibMusl = Task {
+      val dest = Task.dest
+      val muslHome = muslToolchain().path
+      val zlibTarball = s"zlib-${zlibVersion()}.tar.gz"
+      val zlibUrl = s"https://zlib.net/$zlibTarball"
+
+      // Download zlib source
+      os.write(dest / zlibTarball, requests.get.stream(zlibUrl))
+
+      // Extract
+      os.proc("tar", "-xzf", zlibTarball).call(cwd = dest)
+
+      // Configure and build zlib with musl
+      val zlibSrcDir = dest / s"zlib-${zlibVersion()}"
+      os.proc("./configure", s"--prefix=$muslHome", "--static")
+        .call(cwd = zlibSrcDir, env = Map("CC" -> s"$muslHome/bin/musl-gcc"))
+      os.proc("make", "-j", java.lang.Runtime.getRuntime.availableProcessors().toString)
+        .call(cwd = zlibSrcDir)
+      os.proc("make", "install").call(cwd = zlibSrcDir)
+
+      PathRef(muslHome)
+    }
+
+    /** Download and build mimalloc (for better allocator performance with musl) */
+    def mimallocLib = Task {
+      val dest = Task.dest
+      val muslHome = muslToolchain().path
+      val mimallocZip = s"v${mimallocVersion()}.tar.gz"
+      val mimallocUrl = s"https://github.com/microsoft/mimalloc/archive/refs/tags/$mimallocZip"
+
+      // Download mimalloc source
+      os.write(dest / mimallocZip, requests.get.stream(mimallocUrl))
+
+      // Extract
+      os.proc("tar", "-xzf", mimallocZip).call(cwd = dest)
+
+      // Build mimalloc with musl-gcc
+      val mimallocSrcDir = dest / s"mimalloc-${mimallocVersion()}"
+      val buildDir = mimallocSrcDir / "build"
+      os.makeDir.all(buildDir)
+
+      // Configure with CMake
+      os.proc(
+        "cmake",
+        "..",
+        "-DCMAKE_BUILD_TYPE=Release",
+        s"-DCMAKE_C_COMPILER=$muslHome/bin/musl-gcc",
+        "-DCMAKE_C_FLAGS=-fPIC",
+        "-DMI_BUILD_SHARED=OFF",
+        "-DMI_BUILD_TESTS=OFF"
+      ).call(cwd = buildDir)
+
+      // Build
+      os.proc("make", "-j", java.lang.Runtime.getRuntime.availableProcessors().toString)
+        .call(cwd = buildDir)
+
+      PathRef(buildDir / "libmimalloc.a")
+    }
+
+    def nativeImageOptions = Task {
+      val baseOptions = Seq(
+        "--no-fallback",
+        "--enable-url-protocols=https",
+        "-Os",
+        // Build for compatibility with older CPUs that lack AVX2 and other modern features
+        // https://github.com/com-lihaoyi/mill/issues/4630
+        "-march=compatibility",
+        // Allow users to use authenticated proxies
+        "-Djdk.http.auth.tunneling.disabledSchemes=",
+        // Set UTF-8 encoding to fix Unicode character display issues on Windows
+        "-Dfile.encoding=UTF-8",
+        "-Dsun.stdout.encoding=UTF-8",
+        "-Dsun.stderr.encoding=UTF-8"
+        // Enable JVisualVM support
+        // https://www.graalvm.org/latest/tools/visualvm/#using-visualvm-with-graalvm-native-executables
+        // "--enable-monitoring=jvmstat,heapdump"
+      )
+
+      // On Linux, use static linking with musl libc, mimalloc, and a 2 MiB stack size
+      // See https://github.com/com-lihaoyi/mill/discussions/5568
+      val isLinux = System.getProperty("os.name").toLowerCase.contains("linux")
+      if (isLinux) {
+        val muslHome = zlibMusl().path // zlibMusl depends on muslToolchain
+        val mimallocPath = mimallocLib().path
+
+        baseOptions ++ Seq(
+          // Static linking with musl libc
+          "--static",
+          "--libc=musl",
+          // Point to the musl/zlib libraries
+          s"-H:CLibraryPath=$muslHome/lib",
+          // Set stack size to 2 MiB (musl default is too small at 128 KiB)
+          "-R:StackSize=2m",
+          // Use gold linker - the default ld on RHEL8 can't handle ZSTD compressed debug info in GraalVM libs
+          "-H:NativeLinkerOption=-fuse-ld=gold",
+          // Link mimalloc for better allocator performance
+          s"-H:NativeLinkerOption=-Wl,--whole-archive",
+          s"-H:NativeLinkerOption=$mimallocPath",
+          s"-H:NativeLinkerOption=-Wl,--no-whole-archive"
+        )
+      } else {
+        baseOptions
+      }
+    }
+
+    /** Custom nativeImage to add musl bin to PATH on Linux */
+    def nativeImage: T[PathRef] = Task {
+      val dest = Task.dest
+      val executeableName = "native-executable"
+
+      // Build the base environment
+      val baseEnv = sys.env
+
+      // On Linux, add the musl bin directory to PATH so native-image can find musl-gcc
+      val env = {
+        val isLinux = System.getProperty("os.name").toLowerCase.contains("linux")
+        if (isLinux) {
+          val muslHome = zlibMusl().path
+          val muslBin = muslHome / "bin"
+          val currentPath = baseEnv.getOrElse("PATH", "")
+          baseEnv + ("PATH" -> s"$muslBin:$currentPath")
+        } else {
+          baseEnv
+        }
+      }
+
+      val command = Seq.newBuilder[String]
+        .+=(nativeImageTool().path.toString)
+        .++=(nativeImageOptions())
+        .+=("-cp")
+        .+=(nativeImageClasspath().iterator.map(_.path).mkString(java.io.File.pathSeparator))
+        .+=(finalMainClass())
+        .+=((dest / executeableName).toString())
+        .result()
+
+      os.proc(command).call(cwd = dest, stdout = os.Inherit, env = env)
+
+      val ext = if (mill.constants.Util.isWindows) ".exe" else ""
+      val executable = dest / s"$executeableName$ext"
+      assert(os.exists(executable))
+      PathRef(executable)
+    }
 
     def jvmId = Settings.graalvmJvmId
 
